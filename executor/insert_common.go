@@ -113,7 +113,7 @@ func (e *InsertValues) insertCommon() *InsertValues {
 	return e
 }
 
-func (e *InsertValues) exec(_ context.Context, _ [][]types.Datum) error {
+func (*InsertValues) exec(context.Context, [][]types.Datum) error {
 	panic("derived should overload exec function")
 }
 
@@ -446,8 +446,8 @@ func insertRowsFromSelect(ctx context.Context, base insertCommon) error {
 	// process `insert|replace into ... select ... from ...`
 	e := base.insertCommon()
 	selectExec := e.Children(0)
-	fields := retTypes(selectExec)
-	chk := tryNewCacheChunk(selectExec)
+	fields := exec.RetTypes(selectExec)
+	chk := exec.TryNewCacheChunk(selectExec)
 	iter := chunk.NewIterator4Chunk(chk)
 	rows := make([][]types.Datum, 0, chk.Capacity())
 
@@ -462,7 +462,7 @@ func insertRowsFromSelect(ctx context.Context, base insertCommon) error {
 	// just ignore the transaction which contain `insert|replace into ... select ... from ...` statement.
 	e.Ctx().GetTxnWriteThroughputSLI().SetInvalid()
 	for {
-		err := Next(ctx, selectExec, chk)
+		err := exec.Next(ctx, selectExec, chk)
 		if err != nil {
 			return err
 		}
@@ -692,7 +692,7 @@ func (e *InsertValues) fillRow(ctx context.Context, row []types.Datum, hasValue 
 	}
 	tbl := e.Table.Meta()
 	// Handle exchange partition
-	if tbl.ExchangePartitionInfo != nil && tbl.ExchangePartitionInfo.ExchangePartitionFlag {
+	if tbl.ExchangePartitionInfo != nil {
 		is := e.Ctx().GetDomainInfoSchema().(infoschema.InfoSchema)
 		pt, tableFound := is.TableByID(tbl.ExchangePartitionInfo.ExchangePartitionID)
 		if !tableFound {
@@ -1185,7 +1185,7 @@ func (e *InsertValues) batchCheckAndInsert(
 	defer tracing.StartRegion(ctx, "InsertValues.batchCheckAndInsert").End()
 	start := time.Now()
 	// Get keys need to be checked.
-	toBeCheckedRows, err := getKeysNeedCheck(ctx, e.Ctx(), e.Table, rows)
+	toBeCheckedRows, err := getKeysNeedCheck(e.Ctx(), e.Table, rows)
 	if err != nil {
 		return err
 	}
@@ -1556,6 +1556,6 @@ func (e *InsertRuntimeStat) Merge(other execdetails.RuntimeStats) {
 }
 
 // Tp implements the RuntimeStats interface.
-func (e *InsertRuntimeStat) Tp() int {
+func (*InsertRuntimeStat) Tp() int {
 	return execdetails.TpInsertRuntimeStat
 }

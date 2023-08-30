@@ -30,19 +30,19 @@ import (
 	"go.uber.org/zap"
 )
 
-func splitPartitionTableRegion(ctx sessionctx.Context, store kv.SplittableStore, tbInfo *model.TableInfo, pi *model.PartitionInfo, scatter bool) {
+func splitPartitionTableRegion(ctx sessionctx.Context, store kv.SplittableStore, tbInfo *model.TableInfo, parts []model.PartitionDefinition, scatter bool) {
 	// Max partition count is 8192, should we sample and just choose some partitions to split?
-	regionIDs := make([]uint64, 0, len(pi.Definitions))
+	regionIDs := make([]uint64, 0, len(parts))
 	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), ctx.GetSessionVars().GetSplitRegionTimeout())
 	defer cancel()
 	ctxWithTimeout = kv.WithInternalSourceType(ctxWithTimeout, kv.InternalTxnDDL)
 	if shardingBits(tbInfo) > 0 && tbInfo.PreSplitRegions > 0 {
-		for _, def := range pi.Definitions {
+		for _, def := range parts {
 			regionIDs = append(regionIDs, preSplitPhysicalTableByShardRowID(ctxWithTimeout, store, tbInfo, def.ID, scatter)...)
 		}
 	} else {
-		for _, def := range pi.Definitions {
-			regionIDs = append(regionIDs, SplitRecordRegion(ctxWithTimeout, store, def.ID, scatter))
+		for _, def := range parts {
+			regionIDs = append(regionIDs, SplitRecordRegion(ctxWithTimeout, store, def.ID, tbInfo.ID, scatter))
 		}
 	}
 	if scatter {
@@ -58,7 +58,7 @@ func splitTableRegion(ctx sessionctx.Context, store kv.SplittableStore, tbInfo *
 	if shardingBits(tbInfo) > 0 && tbInfo.PreSplitRegions > 0 {
 		regionIDs = preSplitPhysicalTableByShardRowID(ctxWithTimeout, store, tbInfo, tbInfo.ID, scatter)
 	} else {
-		regionIDs = append(regionIDs, SplitRecordRegion(ctxWithTimeout, store, tbInfo.ID, scatter))
+		regionIDs = append(regionIDs, SplitRecordRegion(ctxWithTimeout, store, tbInfo.ID, tbInfo.ID, scatter))
 	}
 	if scatter {
 		WaitScatterRegionFinish(ctxWithTimeout, store, regionIDs...)
@@ -118,8 +118,8 @@ func preSplitPhysicalTableByShardRowID(ctx context.Context, store kv.SplittableS
 }
 
 // SplitRecordRegion is to split region in store by table prefix.
-func SplitRecordRegion(ctx context.Context, store kv.SplittableStore, tableID int64, scatter bool) uint64 {
-	tableStartKey := tablecodec.GenTablePrefix(tableID)
+func SplitRecordRegion(ctx context.Context, store kv.SplittableStore, physicalTableID, tableID int64, scatter bool) uint64 {
+	tableStartKey := tablecodec.GenTablePrefix(physicalTableID)
 	regionIDs, err := store.SplitRegions(ctx, [][]byte{tableStartKey}, scatter, &tableID)
 	if err != nil {
 		// It will be automatically split by TiKV later.

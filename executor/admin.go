@@ -29,8 +29,6 @@ import (
 	"github.com/pingcap/tidb/parser/model"
 	"github.com/pingcap/tidb/parser/terror"
 	plannercore "github.com/pingcap/tidb/planner/core"
-	"github.com/pingcap/tidb/sessionctx/stmtctx"
-	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/table/tables"
 	"github.com/pingcap/tidb/tablecodec"
@@ -113,7 +111,7 @@ func (e *CheckIndexRangeExec) Open(ctx context.Context) error {
 		FieldType: *colTypeForHandle,
 	})
 
-	e.srcChunk = tryNewCacheChunk(e)
+	e.srcChunk = exec.TryNewCacheChunk(e)
 	dagPB, err := e.buildDAGPB()
 	if err != nil {
 		return err
@@ -136,7 +134,7 @@ func (e *CheckIndexRangeExec) Open(ctx context.Context) error {
 		return err
 	}
 
-	e.result, err = distsql.Select(ctx, e.Ctx(), kvReq, e.RetFieldTypes(), statistics.NewQueryFeedback(0, nil, 0, false))
+	e.result, err = distsql.Select(ctx, e.Ctx(), kvReq, e.RetFieldTypes())
 	if err != nil {
 		return err
 	}
@@ -172,7 +170,7 @@ func (e *CheckIndexRangeExec) constructIndexScanPB() *tipb.Executor {
 }
 
 // Close implements the Executor Close interface.
-func (e *CheckIndexRangeExec) Close() error {
+func (*CheckIndexRangeExec) Close() error {
 	return nil
 }
 
@@ -237,14 +235,14 @@ func (e *RecoverIndexExec) constructTableScanPB(tblInfo *model.TableInfo, colInf
 	return &tipb.Executor{Tp: tipb.ExecType_TypeTableScan, TblScan: tblScan}, err
 }
 
-func (e *RecoverIndexExec) constructLimitPB(count uint64) *tipb.Executor {
+func (*RecoverIndexExec) constructLimitPB(count uint64) *tipb.Executor {
 	limitExec := &tipb.Limit{
 		Limit: count,
 	}
 	return &tipb.Executor{Tp: tipb.ExecType_TypeLimit, Limit: limitExec}
 }
 
-func (e *RecoverIndexExec) buildDAGPB(txn kv.Transaction, limitCnt uint64) (*tipb.DAGRequest, error) {
+func (e *RecoverIndexExec) buildDAGPB(_ kv.Transaction, limitCnt uint64) (*tipb.DAGRequest, error) {
 	dagReq := &tipb.DAGRequest{}
 	dagReq.TimeZoneName, dagReq.TimeZoneOffset = timeutil.Zone(e.Ctx().GetSessionVars().Location())
 	sc := e.Ctx().GetSessionVars().StmtCtx
@@ -271,7 +269,7 @@ func (e *RecoverIndexExec) buildTableScan(ctx context.Context, txn kv.Transactio
 		return nil, err
 	}
 	var builder distsql.RequestBuilder
-	keyRanges, err := buildRecoverIndexKeyRanges(e.Ctx().GetSessionVars().StmtCtx, e.physicalID, startHandle)
+	keyRanges, err := buildRecoverIndexKeyRanges(e.physicalID, startHandle)
 	if err != nil {
 		return nil, err
 	}
@@ -291,7 +289,7 @@ func (e *RecoverIndexExec) buildTableScan(ctx context.Context, txn kv.Transactio
 	// Actually, with limitCnt, the match datas maybe only in one region, so let the concurrency to be 1,
 	// avoid unnecessary region scan.
 	kvReq.Concurrency = 1
-	result, err := distsql.Select(ctx, e.Ctx(), kvReq, e.columnsTypes(), statistics.NewQueryFeedback(0, nil, 0, false))
+	result, err := distsql.Select(ctx, e.Ctx(), kvReq, e.columnsTypes())
 	if err != nil {
 		return nil, err
 	}
@@ -299,7 +297,7 @@ func (e *RecoverIndexExec) buildTableScan(ctx context.Context, txn kv.Transactio
 }
 
 // buildRecoverIndexKeyRanges build a KeyRange: (startHandle, unlimited).
-func buildRecoverIndexKeyRanges(sctx *stmtctx.StatementContext, tid int64, startHandle kv.Handle) ([]kv.KeyRange, error) {
+func buildRecoverIndexKeyRanges(tid int64, startHandle kv.Handle) ([]kv.KeyRange, error) {
 	var startKey []byte
 	if startHandle == nil {
 		startKey = tablecodec.GenTableRecordPrefix(tid).Next()
@@ -316,12 +314,10 @@ type backfillResult struct {
 	scanRowCount  int64
 }
 
-func (e *RecoverIndexExec) backfillIndex(ctx context.Context) (int64, int64, error) {
+func (e *RecoverIndexExec) backfillIndex(ctx context.Context) (totalAddedCnt, totalScanCnt int64, err error) {
 	var (
-		currentHandle kv.Handle = nil
-		totalAddedCnt           = int64(0)
-		totalScanCnt            = int64(0)
-		lastLogCnt              = int64(0)
+		currentHandle kv.Handle
+		lastLogCnt    int64
 		result        backfillResult
 	)
 	for {
@@ -791,14 +787,14 @@ func (e *CleanupIndexExec) cleanTableIndex(ctx context.Context) error {
 }
 
 func (e *CleanupIndexExec) buildIndexScan(ctx context.Context, txn kv.Transaction) (distsql.SelectResult, error) {
-	dagPB, err := e.buildIdxDAGPB(txn)
+	dagPB, err := e.buildIdxDAGPB()
 	if err != nil {
 		return nil, err
 	}
 	sc := e.Ctx().GetSessionVars().StmtCtx
 	var builder distsql.RequestBuilder
 	ranges := ranger.FullRange()
-	keyRanges, err := distsql.IndexRangesToKVRanges(sc, e.physicalID, e.index.Meta().ID, ranges, nil)
+	keyRanges, err := distsql.IndexRangesToKVRanges(sc, e.physicalID, e.index.Meta().ID, ranges)
 	if err != nil {
 		return nil, err
 	}
@@ -820,7 +816,7 @@ func (e *CleanupIndexExec) buildIndexScan(ctx context.Context, txn kv.Transactio
 	}
 
 	kvReq.Concurrency = 1
-	result, err := distsql.Select(ctx, e.Ctx(), kvReq, e.getIdxColTypes(), statistics.NewQueryFeedback(0, nil, 0, false))
+	result, err := distsql.Select(ctx, e.Ctx(), kvReq, e.getIdxColTypes())
 	if err != nil {
 		return nil, err
 	}
@@ -849,7 +845,7 @@ func (e *CleanupIndexExec) init() error {
 	return nil
 }
 
-func (e *CleanupIndexExec) buildIdxDAGPB(txn kv.Transaction) (*tipb.DAGRequest, error) {
+func (e *CleanupIndexExec) buildIdxDAGPB() (*tipb.DAGRequest, error) {
 	dagReq := &tipb.DAGRequest{}
 	dagReq.TimeZoneName, dagReq.TimeZoneOffset = timeutil.Zone(e.Ctx().GetSessionVars().Location())
 	sc := e.Ctx().GetSessionVars().StmtCtx
@@ -889,6 +885,6 @@ func (e *CleanupIndexExec) constructLimitPB() *tipb.Executor {
 }
 
 // Close implements the Executor Close interface.
-func (e *CleanupIndexExec) Close() error {
+func (*CleanupIndexExec) Close() error {
 	return nil
 }

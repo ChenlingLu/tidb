@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"io"
 	"math"
 	"net"
@@ -267,15 +268,15 @@ func (*encodingBuilder) MakeEmptyRows() encode.Rows {
 type targetInfoGetter struct {
 	tls      *common.TLS
 	targetDB *sql.DB
-	pdAddr   string
+	pdCli    pd.Client
 }
 
 // NewTargetInfoGetter creates an TargetInfoGetter with local backend implementation.
-func NewTargetInfoGetter(tls *common.TLS, db *sql.DB, pdAddr string) backend.TargetInfoGetter {
+func NewTargetInfoGetter(tls *common.TLS, db *sql.DB, pdCli pd.Client) backend.TargetInfoGetter {
 	return &targetInfoGetter{
 		tls:      tls,
 		targetDB: db,
-		pdAddr:   pdAddr,
+		pdCli:    pdCli,
 	}
 }
 
@@ -296,10 +297,10 @@ func (g *targetInfoGetter) CheckRequirements(ctx context.Context, checkCtx *back
 	if err := checkTiDBVersion(ctx, versionStr, localMinTiDBVersion, localMaxTiDBVersion); err != nil {
 		return err
 	}
-	if err := tikv.CheckPDVersion(ctx, g.tls, g.pdAddr, localMinPDVersion, localMaxPDVersion); err != nil {
+	if err := tikv.CheckPDVersion(ctx, g.tls, g.pdCli.GetLeaderAddr(), localMinPDVersion, localMaxPDVersion); err != nil {
 		return err
 	}
-	if err := tikv.CheckTiKVVersion(ctx, g.tls, g.pdAddr, localMinTiKVVersion, localMaxTiKVVersion); err != nil {
+	if err := tikv.CheckTiKVVersion(ctx, g.tls, g.pdCli.GetLeaderAddr(), localMinTiKVVersion, localMaxTiKVVersion); err != nil {
 		return err
 	}
 
@@ -407,7 +408,7 @@ type BackendConfig struct {
 	// whether check TiKV capacity before write & ingest.
 	ShouldCheckTiKV    bool
 	DupeDetectEnabled  bool
-	DuplicateDetectOpt DupDetectOpt
+	DuplicateDetectOpt common.DupDetectOpt
 	// max write speed in bytes per second to each store(burst is allowed), 0 means no limit
 	StoreWriteBWLimit int
 	// When TiKV is in normal mode, ingesting too many SSTs will cause TiKV write stall.
@@ -420,31 +421,37 @@ type BackendConfig struct {
 	MaxOpenFiles int
 	KeyspaceName string
 	// the scope when pause PD schedulers.
-	PausePDSchedulerScope config.PausePDSchedulerScope
+	PausePDSchedulerScope     config.PausePDSchedulerScope
+	ResourceGroupName         string
+	TaskType                  string
+	RaftKV2SwitchModeDuration time.Duration
 }
 
 // NewBackendConfig creates a new BackendConfig.
-func NewBackendConfig(cfg *config.Config, maxOpenFiles int, keyspaceName string) BackendConfig {
+func NewBackendConfig(cfg *config.Config, maxOpenFiles int, keyspaceName, resourceGroupName, taskType string, raftKV2SwitchModeDuration time.Duration) BackendConfig {
 	return BackendConfig{
-		PDAddr:                  cfg.TiDB.PdAddr,
-		LocalStoreDir:           cfg.TikvImporter.SortedKVDir,
-		MaxConnPerStore:         cfg.TikvImporter.RangeConcurrency,
-		ConnCompressType:        cfg.TikvImporter.CompressKVPairs,
-		WorkerConcurrency:       cfg.TikvImporter.RangeConcurrency * 2,
-		KVWriteBatchSize:        int64(cfg.TikvImporter.SendKVSize),
-		RegionSplitBatchSize:    cfg.TikvImporter.RegionSplitBatchSize,
-		RegionSplitConcurrency:  cfg.TikvImporter.RegionSplitConcurrency,
-		CheckpointEnabled:       cfg.Checkpoint.Enable,
-		MemTableSize:            int(cfg.TikvImporter.EngineMemCacheSize),
-		LocalWriterMemCacheSize: int64(cfg.TikvImporter.LocalWriterMemCacheSize),
-		ShouldCheckTiKV:         cfg.App.CheckRequirements,
-		DupeDetectEnabled:       cfg.TikvImporter.DuplicateResolution != config.DupeResAlgNone,
-		DuplicateDetectOpt:      DupDetectOpt{ReportErrOnDup: cfg.TikvImporter.DuplicateResolution == config.DupeResAlgErr},
-		StoreWriteBWLimit:       int(cfg.TikvImporter.StoreWriteBWLimit),
-		ShouldCheckWriteStall:   cfg.Cron.SwitchMode.Duration == 0,
-		MaxOpenFiles:            maxOpenFiles,
-		KeyspaceName:            keyspaceName,
-		PausePDSchedulerScope:   cfg.TikvImporter.PausePDSchedulerScope,
+		PDAddr:                    cfg.TiDB.PdAddr,
+		LocalStoreDir:             cfg.TikvImporter.SortedKVDir,
+		MaxConnPerStore:           cfg.TikvImporter.RangeConcurrency,
+		ConnCompressType:          cfg.TikvImporter.CompressKVPairs,
+		WorkerConcurrency:         cfg.TikvImporter.RangeConcurrency * 2,
+		KVWriteBatchSize:          int64(cfg.TikvImporter.SendKVSize),
+		RegionSplitBatchSize:      cfg.TikvImporter.RegionSplitBatchSize,
+		RegionSplitConcurrency:    cfg.TikvImporter.RegionSplitConcurrency,
+		CheckpointEnabled:         cfg.Checkpoint.Enable,
+		MemTableSize:              int(cfg.TikvImporter.EngineMemCacheSize),
+		LocalWriterMemCacheSize:   int64(cfg.TikvImporter.LocalWriterMemCacheSize),
+		ShouldCheckTiKV:           cfg.App.CheckRequirements,
+		DupeDetectEnabled:         cfg.TikvImporter.DuplicateResolution != config.DupeResAlgNone,
+		DuplicateDetectOpt:        common.DupDetectOpt{ReportErrOnDup: cfg.TikvImporter.DuplicateResolution == config.DupeResAlgErr},
+		StoreWriteBWLimit:         int(cfg.TikvImporter.StoreWriteBWLimit),
+		ShouldCheckWriteStall:     cfg.Cron.SwitchMode.Duration == 0,
+		MaxOpenFiles:              maxOpenFiles,
+		KeyspaceName:              keyspaceName,
+		PausePDSchedulerScope:     cfg.TikvImporter.PausePDSchedulerScope,
+		ResourceGroupName:         resourceGroupName,
+		TaskType:                  taskType,
+		RaftKV2SwitchModeDuration: raftKV2SwitchModeDuration,
 	}
 }
 
@@ -467,7 +474,7 @@ type Backend struct {
 
 	supportMultiIngest  bool
 	duplicateDB         *pebble.DB
-	keyAdapter          KeyAdapter
+	keyAdapter          common.KeyAdapter
 	importClientFactory ImportClientFactory
 
 	bufferPool   *membuf.Pool
@@ -560,9 +567,9 @@ func NewBackend(
 		return nil, common.ErrCreateKVClient.Wrap(err).GenWithStackByArgs()
 	}
 	importClientFactory := newImportClientFactoryImpl(splitCli, tls, config.MaxConnPerStore, config.ConnCompressType)
-	keyAdapter := KeyAdapter(noopKeyAdapter{})
+	keyAdapter := common.KeyAdapter(common.NoopKeyAdapter{})
 	if config.DupeDetectEnabled {
-		keyAdapter = dupDetectKeyAdapter{}
+		keyAdapter = common.DupDetectKeyAdapter{}
 	}
 	var writeLimiter StoreWriteLimiter
 	if config.StoreWriteBWLimit > 0 {
@@ -1019,7 +1026,7 @@ func (local *Backend) readAndSplitIntoRange(
 	sizeLimit int64,
 	keysLimit int64,
 ) ([]Range, error) {
-	firstKey, lastKey, err := engine.getFirstAndLastKey(nil, nil)
+	firstKey, lastKey, err := engine.GetFirstAndLastKey(nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1089,7 +1096,7 @@ func (local *Backend) prepareAndSendJob(
 			failpoint.Break()
 		})
 
-		err = local.SplitAndScatterRegionInBatches(ctx, initialSplitRanges, engine.tableInfo, needSplit, regionSplitSize, maxBatchSplitRanges)
+		err = local.SplitAndScatterRegionInBatches(ctx, initialSplitRanges, needSplit, maxBatchSplitRanges)
 		if err == nil || common.IsContextCanceledError(err) {
 			break
 		}
@@ -1116,18 +1123,20 @@ func (local *Backend) prepareAndSendJob(
 // generateAndSendJob scans the region in ranges and send region jobs to jobToWorkerCh.
 func (local *Backend) generateAndSendJob(
 	ctx context.Context,
-	engine *Engine,
+	engine common.Engine,
 	jobRanges []Range,
 	regionSplitSize, regionSplitKeys int64,
 	jobToWorkerCh chan<- *regionJob,
 	jobWg *sync.WaitGroup,
 ) error {
 	logger := log.FromContext(ctx)
+	// TODO(lance6716): external engine should also support it
+	localEngine, ok := engine.(*Engine)
 
 	// when use dynamic region feature, the region may be very big, we need
 	// to split to smaller ranges to increase the concurrency.
-	if regionSplitSize > 2*int64(config.SplitRegionSize) {
-		sizeProps, err := getSizePropertiesFn(logger, engine.getDB(), local.keyAdapter)
+	if regionSplitSize > 2*int64(config.SplitRegionSize) && ok {
+		sizeProps, err := getSizePropertiesFn(logger, localEngine.getDB(), local.keyAdapter)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -1140,17 +1149,28 @@ func (local *Backend) generateAndSendJob(
 	}
 	logger.Debug("the ranges length write to tikv", zap.Int("length", len(jobRanges)))
 
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	eg, egCtx := errgroup.WithContext(ctx)
 	eg.SetLimit(local.WorkerConcurrency)
 	for _, jobRange := range jobRanges {
 		r := jobRange
+		data, err := engine.LoadIngestData(ctx, r.start, r.end)
+		if err != nil {
+			cancel()
+			err2 := eg.Wait()
+			if err2 != nil && !common.IsContextCanceledError(err2) {
+				logger.Warn("meet error when canceling", log.ShortError(err2))
+			}
+			return errors.Trace(err)
+		}
 		eg.Go(func() error {
 			if egCtx.Err() != nil {
 				return nil
 			}
 
 			failpoint.Inject("beforeGenerateJob", nil)
-			jobs, err := local.generateJobForRange(egCtx, engine, r, regionSplitSize, regionSplitKeys)
+			jobs, err := local.generateJobForRange(egCtx, data, r, regionSplitSize, regionSplitKeys)
 			if err != nil {
 				if common.IsContextCanceledError(err) {
 					return nil
@@ -1186,7 +1206,7 @@ var fakeRegionJobs map[[2]string]struct {
 // It will retry internally when scan region meet error.
 func (local *Backend) generateJobForRange(
 	ctx context.Context,
-	engine *Engine,
+	data common.IngestData,
 	keyRange Range,
 	regionSplitSize, regionSplitKeys int64,
 ) ([]*regionJob, error) {
@@ -1205,7 +1225,7 @@ func (local *Backend) generateJobForRange(
 	})
 
 	start, end := keyRange.start, keyRange.end
-	pairStart, pairEnd, err := engine.getFirstAndLastKey(start, end)
+	pairStart, pairEnd, err := data.GetFirstAndLastKey(start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -1242,7 +1262,7 @@ func (local *Backend) generateJobForRange(
 			keyRange:        intersectRange(region.Region, Range{start: start, end: end}),
 			region:          region,
 			stage:           regionScanned,
-			engine:          engine,
+			ingestData:      data,
 			regionSplitSize: regionSplitSize,
 			regionSplitKeys: regionSplitKeys,
 			metrics:         local.metrics,
@@ -1278,7 +1298,7 @@ func (local *Backend) startWorker(
 			case needRescan:
 				jobs, err2 := local.generateJobForRange(
 					ctx,
-					job.engine,
+					job.ingestData,
 					job.keyRange,
 					job.regionSplitSize,
 					job.regionSplitKeys,
@@ -1452,16 +1472,39 @@ func (local *Backend) ImportEngine(ctx context.Context, engineUUID uuid.UUID, re
 		}()
 	}
 
-	log.FromContext(ctx).Info("start import engine", zap.Stringer("uuid", engineUUID),
-		zap.Int("region ranges", len(regionRanges)), zap.Int64("count", lfLength), zap.Int64("size", lfTotalSize))
+	if len(regionRanges) > 0 && local.BackendConfig.RaftKV2SwitchModeDuration > 0 {
+		log.FromContext(ctx).Info("switch import mode of ranges",
+			zap.String("startKey", hex.EncodeToString(regionRanges[0].start)),
+			zap.String("endKey", hex.EncodeToString(regionRanges[len(regionRanges)-1].end)))
+		subCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		done, err := local.SwitchModeByKeyRanges(subCtx, regionRanges)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		defer func() {
+			cancel()
+			<-done
+		}()
+	}
+
+	log.FromContext(ctx).Info("start import engine",
+		zap.Stringer("uuid", engineUUID),
+		zap.Int("region ranges", len(regionRanges)),
+		zap.Int64("count", lfLength),
+		zap.Int64("size", lfTotalSize))
 
 	failpoint.Inject("ReadyForImportEngine", func() {})
 
 	err = local.doImport(ctx, lf, regionRanges, regionSplitSize, regionSplitKeys)
 	if err == nil {
-		log.FromContext(ctx).Info("import engine success", zap.Stringer("uuid", engineUUID),
-			zap.Int64("size", lfTotalSize), zap.Int64("kvs", lfLength),
-			zap.Int64("importedSize", lf.importedKVSize.Load()), zap.Int64("importedCount", lf.importedKVCount.Load()))
+		log.FromContext(ctx).Info("import engine success",
+			zap.Stringer("uuid", engineUUID),
+			zap.Int64("size", lfTotalSize),
+			zap.Int64("kvs", lfLength),
+			zap.Int64("importedSize", lf.importedKVSize.Load()),
+			zap.Int64("importedCount", lf.importedKVCount.Load()))
 	}
 	return err
 }
@@ -1658,6 +1701,8 @@ func (local *Backend) GetDupeController(dupeConcurrency int, errorMgr *errormana
 		duplicateDB:         local.duplicateDB,
 		keyAdapter:          local.keyAdapter,
 		importClientFactory: local.importClientFactory,
+		resourceGroupName:   local.ResourceGroupName,
+		taskType:            local.TaskType,
 	}
 }
 
@@ -1691,6 +1736,51 @@ func (local *Backend) LocalWriter(_ context.Context, cfg *backend.LocalWriterCon
 	}
 	engine := e.(*Engine)
 	return openLocalWriter(cfg, engine, local.tikvCodec, local.LocalWriterMemCacheSize, local.bufferPool.NewBuffer())
+}
+
+// SwitchModeByKeyRanges will switch tikv mode for regions in the specific key range for multirocksdb.
+// This function will spawn a goroutine to keep switch mode periodically until the context is done.
+// The return done channel is used to notify the caller that the background goroutine is exited.
+func (local *Backend) SwitchModeByKeyRanges(ctx context.Context, ranges []Range) (<-chan struct{}, error) {
+	switcher := NewTiKVModeSwitcher(local.tls, local.pdCtl.GetPDClient(), log.FromContext(ctx).Logger)
+	done := make(chan struct{})
+
+	keyRanges := make([]*sst.Range, 0, len(ranges))
+	for _, r := range ranges {
+		startKey := r.start
+		if len(r.start) > 0 {
+			startKey = codec.EncodeBytes(nil, r.start)
+		}
+		endKey := r.end
+		if len(r.end) > 0 {
+			endKey = codec.EncodeBytes(nil, r.end)
+		}
+		keyRanges = append(keyRanges, &sst.Range{
+			Start: startKey,
+			End:   endKey,
+		})
+	}
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(local.BackendConfig.RaftKV2SwitchModeDuration)
+		defer ticker.Stop()
+		switcher.ToImportMode(ctx, keyRanges...)
+	loop:
+		for {
+			select {
+			case <-ctx.Done():
+				break loop
+			case <-ticker.C:
+				switcher.ToImportMode(ctx, keyRanges...)
+			}
+		}
+		// Use a new context to avoid the context is canceled by the caller.
+		recoverCtx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+		defer cancel()
+		switcher.ToNormalMode(recoverCtx, keyRanges...)
+	}()
+	return done, nil
 }
 
 func openLocalWriter(cfg *backend.LocalWriterConfig, engine *Engine, tikvCodec tikvclient.Codec, cacheSize int64, kvBuffer *membuf.Buffer) (*Writer, error) {

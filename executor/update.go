@@ -169,7 +169,7 @@ func (e *UpdateExec) merge(row, newData []types.Datum, mergeGenerated bool) erro
 	return nil
 }
 
-func (e *UpdateExec) exec(ctx context.Context, schema *expression.Schema, row, newData []types.Datum) error {
+func (e *UpdateExec) exec(ctx context.Context, _ *expression.Schema, row, newData []types.Datum) error {
 	defer trace.StartRegion(ctx, "UpdateExec").End()
 	bAssignFlag := make([]bool, len(e.assignFlag))
 	for i, flag := range e.assignFlag {
@@ -248,10 +248,10 @@ func (e *UpdateExec) Next(ctx context.Context, req *chunk.Chunk) error {
 }
 
 func (e *UpdateExec) updateRows(ctx context.Context) (int, error) {
-	fields := retTypes(e.Children(0))
+	fields := exec.RetTypes(e.Children(0))
 	colsInfo := plannercore.GetUpdateColumnsInfo(e.tblID2table, e.tblColPosInfos, len(fields))
 	globalRowIdx := 0
-	chk := tryNewCacheChunk(e.Children(0))
+	chk := exec.TryNewCacheChunk(e.Children(0))
 	if !e.allAssignmentsAreConstant {
 		e.evalBuffer = chunk.MutRowFromTypes(fields)
 	}
@@ -263,7 +263,7 @@ func (e *UpdateExec) updateRows(ctx context.Context) (int, error) {
 	totalNumRows := 0
 	for {
 		e.memTracker.Consume(-memUsageOfChk)
-		err := Next(ctx, e.Children(0), chk)
+		err := exec.Next(ctx, e.Children(0), chk)
 		if err != nil {
 			return 0, err
 		}
@@ -326,7 +326,7 @@ func (e *UpdateExec) updateRows(ctx context.Context) (int, error) {
 	return totalNumRows, nil
 }
 
-func (e *UpdateExec) handleErr(colName model.CIStr, rowIdx int, err error) error {
+func (*UpdateExec) handleErr(colName model.CIStr, rowIdx int, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -535,7 +535,7 @@ func (e *updateRuntimeStats) Merge(other execdetails.RuntimeStats) {
 }
 
 // Tp implements the RuntimeStats interface.
-func (e *updateRuntimeStats) Tp() int {
+func (*updateRuntimeStats) Tp() int {
 	return execdetails.TpUpdateRuntimeStats
 }
 

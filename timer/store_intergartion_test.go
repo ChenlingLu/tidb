@@ -16,20 +16,25 @@ package timer_test
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/ngaut/pools"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/testkit"
 	"github.com/pingcap/tidb/timer/api"
+	"github.com/pingcap/tidb/timer/runtime"
 	"github.com/pingcap/tidb/timer/tablestore"
+	"github.com/pingcap/tidb/util/timeutil"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/tests/v3/integration"
 )
 
 func TestMemTimerStore(t *testing.T) {
+	timeutil.SetSystemTZ("Asia/Shanghai")
 	store := api.NewMemoryTimerStore()
 	defer store.Close()
 	runTimerStoreTest(t, store)
@@ -40,6 +45,7 @@ func TestMemTimerStore(t *testing.T) {
 }
 
 func TestTableTimerStore(t *testing.T) {
+	timeutil.SetSystemTZ("Asia/Shanghai")
 	store := testkit.CreateMockStore(t)
 	tk := testkit.NewTestKit(t, store)
 	dbName := "test"
@@ -57,6 +63,15 @@ func TestTableTimerStore(t *testing.T) {
 	defer timerStore.Close()
 	runTimerStoreTest(t, timerStore)
 
+	// test cluster time zone
+	runClusterTimeZoneTest(t, timerStore, func(tz string) {
+		r, err := pool.Get()
+		defer pool.Put(r)
+		require.NoError(t, err)
+		err = r.(sessionctx.Context).GetSessionVars().GlobalVarsAccessor.SetGlobalSysVar(context.Background(), "time_zone", tz)
+		require.NoError(t, err)
+	})
+
 	// test notifications
 	integration.BeforeTestExternal(t)
 	testEtcdCluster := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
@@ -68,6 +83,29 @@ func TestTableTimerStore(t *testing.T) {
 	timerStore = tablestore.NewTableTimerStore(1, pool, dbName, tblName, cli)
 	defer timerStore.Close()
 	runTimerStoreWatchTest(t, timerStore)
+}
+
+func runClusterTimeZoneTest(t *testing.T, store *api.TimerStore, setClusterTZ func(string)) {
+	timerID, err := store.Create(context.Background(), &api.TimerRecord{
+		TimerSpec: api.TimerSpec{
+			Namespace:       "n1",
+			Key:             "/path/to/testtz",
+			TimeZone:        "",
+			SchedPolicyType: api.SchedEventCron,
+			SchedPolicyExpr: "* 1 * * *",
+		},
+	})
+	require.NoError(t, err)
+	timer, err := store.GetByID(context.Background(), timerID)
+	require.NoError(t, err)
+	require.Equal(t, "", timer.TimeZone)
+	require.Equal(t, timeutil.SystemLocation(), timer.Location)
+
+	setClusterTZ("UTC")
+	timer, err = store.GetByID(context.Background(), timerID)
+	require.NoError(t, err)
+	require.Equal(t, "", timer.TimeZone)
+	require.Equal(t, time.UTC, timer.Location)
 }
 
 func runTimerStoreTest(t *testing.T, store *api.TimerStore) {
@@ -87,6 +125,7 @@ func runTimerStoreInsertAndGet(ctx context.Context, t *testing.T, store *api.Tim
 		TimerSpec: api.TimerSpec{
 			Namespace:       "n1",
 			Key:             "/path/to/key",
+			TimeZone:        "",
 			SchedPolicyType: api.SchedEventInterval,
 			SchedPolicyExpr: "1h",
 			Data:            []byte("data1"),
@@ -100,6 +139,7 @@ func runTimerStoreInsertAndGet(ctx context.Context, t *testing.T, store *api.Tim
 	require.Equal(t, recordTpl, *record)
 	require.NotEmpty(t, id)
 	recordTpl.ID = id
+	recordTpl.Location = timeutil.SystemLocation()
 	recordTpl.EventStatus = api.SchedEventIdle
 
 	// get by id
@@ -147,6 +187,11 @@ func runTimerStoreInsertAndGet(ctx context.Context, t *testing.T, store *api.Tim
 	_, err = store.Create(ctx, invalid)
 	require.EqualError(t, err, "schedule event configuration is not valid: invalid schedule event expr '1x': unknown unit x")
 
+	invalid.SchedPolicyExpr = "1h"
+	invalid.TimeZone = "tidb"
+	_, err = store.Create(ctx, invalid)
+	require.ErrorContains(t, err, "Unknown or incorrect time zone: 'tidb'")
+
 	return &recordTpl
 }
 
@@ -160,15 +205,27 @@ func runTimerStoreUpdate(ctx context.Context, t *testing.T, store *api.TimerStor
 	watermark := time.Unix(7890123, 0)
 	err = store.Update(ctx, tpl.ID, &api.TimerUpdate{
 		Tags:            api.NewOptionalVal([]string{"l1", "l2"}),
+		TimeZone:        api.NewOptionalVal("UTC"),
 		SchedPolicyExpr: api.NewOptionalVal("2h"),
-		EventStatus:     api.NewOptionalVal(api.SchedEventTrigger),
-		EventID:         api.NewOptionalVal(eventID),
-		EventData:       api.NewOptionalVal([]byte("eventdata1")),
-		EventStart:      api.NewOptionalVal(eventStart),
-		Watermark:       api.NewOptionalVal(watermark),
-		SummaryData:     api.NewOptionalVal([]byte("summary1")),
-		CheckVersion:    api.NewOptionalVal(orgRecord.Version),
-		CheckEventID:    api.NewOptionalVal(""),
+		ManualRequest: api.NewOptionalVal(api.ManualRequest{
+			ManualRequestID:   "req1",
+			ManualRequestTime: time.Unix(123, 0),
+			ManualTimeout:     time.Minute,
+			ManualProcessed:   true,
+			ManualEventID:     "event1",
+		}),
+		EventStatus: api.NewOptionalVal(api.SchedEventTrigger),
+		EventID:     api.NewOptionalVal(eventID),
+		EventData:   api.NewOptionalVal([]byte("eventdata1")),
+		EventStart:  api.NewOptionalVal(eventStart),
+		EventExtra: api.NewOptionalVal(api.EventExtra{
+			EventManualRequestID: "req2",
+			EventWatermark:       time.Unix(456, 0),
+		}),
+		Watermark:    api.NewOptionalVal(watermark),
+		SummaryData:  api.NewOptionalVal([]byte("summary1")),
+		CheckVersion: api.NewOptionalVal(orgRecord.Version),
+		CheckEventID: api.NewOptionalVal(""),
 	})
 	require.NoError(t, err)
 	record, err := store.GetByID(ctx, tpl.ID)
@@ -176,6 +233,8 @@ func runTimerStoreUpdate(ctx context.Context, t *testing.T, store *api.TimerStor
 	require.NotSame(t, orgRecord, record)
 	require.Greater(t, record.Version, tpl.Version)
 	tpl.Version = record.Version
+	tpl.TimeZone = "UTC"
+	tpl.Location = time.UTC
 	tpl.SchedPolicyExpr = "2h"
 	tpl.Tags = []string{"l1", "l2"}
 	tpl.EventStatus = api.SchedEventTrigger
@@ -186,6 +245,17 @@ func runTimerStoreUpdate(ctx context.Context, t *testing.T, store *api.TimerStor
 	require.Equal(t, watermark.Unix(), record.Watermark.Unix())
 	tpl.Watermark = record.Watermark
 	tpl.SummaryData = []byte("summary1")
+	tpl.ManualRequest = api.ManualRequest{
+		ManualRequestID:   "req1",
+		ManualRequestTime: time.Unix(123, 0),
+		ManualTimeout:     time.Minute,
+		ManualProcessed:   true,
+		ManualEventID:     "event1",
+	}
+	tpl.EventExtra = api.EventExtra{
+		EventManualRequestID: "req2",
+		EventWatermark:       time.Unix(456, 0),
+	}
 	require.Equal(t, *tpl, *record)
 
 	// tags full update again
@@ -199,26 +269,63 @@ func runTimerStoreUpdate(ctx context.Context, t *testing.T, store *api.TimerStor
 	tpl.Tags = []string{"l3"}
 	require.Equal(t, *tpl, *record)
 
-	// set some to empty
-	var zeroTime time.Time
+	// update manual request
 	err = store.Update(ctx, tpl.ID, &api.TimerUpdate{
-		Tags:        api.NewOptionalVal([]string(nil)),
-		EventStatus: api.NewOptionalVal(api.SchedEventIdle),
-		EventID:     api.NewOptionalVal(""),
-		EventData:   api.NewOptionalVal([]byte(nil)),
-		EventStart:  api.NewOptionalVal(zeroTime),
-		Watermark:   api.NewOptionalVal(zeroTime),
-		SummaryData: api.NewOptionalVal([]byte(nil)),
+		ManualRequest: api.NewOptionalVal(api.ManualRequest{
+			ManualRequestID: "req3",
+		}),
 	})
 	require.NoError(t, err)
 	record, err = store.GetByID(ctx, tpl.ID)
 	require.NoError(t, err)
 	tpl.Version = record.Version
+	tpl.ManualRequest = api.ManualRequest{
+		ManualRequestID: "req3",
+	}
+	require.Equal(t, *tpl, *record)
+
+	// update event extra
+	err = store.Update(ctx, tpl.ID, &api.TimerUpdate{
+		EventExtra: api.NewOptionalVal(api.EventExtra{
+			EventManualRequestID: "req4",
+		}),
+	})
+	require.NoError(t, err)
+	record, err = store.GetByID(ctx, tpl.ID)
+	require.NoError(t, err)
+	tpl.Version = record.Version
+	tpl.EventExtra = api.EventExtra{
+		EventManualRequestID: "req4",
+	}
+	require.Equal(t, *tpl, *record)
+
+	// set some to empty
+	var zeroTime time.Time
+	err = store.Update(ctx, tpl.ID, &api.TimerUpdate{
+		TimeZone:      api.NewOptionalVal(""),
+		Tags:          api.NewOptionalVal([]string(nil)),
+		ManualRequest: api.NewOptionalVal(api.ManualRequest{}),
+		EventStatus:   api.NewOptionalVal(api.SchedEventIdle),
+		EventID:       api.NewOptionalVal(""),
+		EventData:     api.NewOptionalVal([]byte(nil)),
+		EventStart:    api.NewOptionalVal(zeroTime),
+		EventExtra:    api.NewOptionalVal(api.EventExtra{}),
+		Watermark:     api.NewOptionalVal(zeroTime),
+		SummaryData:   api.NewOptionalVal([]byte(nil)),
+	})
+	require.NoError(t, err)
+	record, err = store.GetByID(ctx, tpl.ID)
+	require.NoError(t, err)
+	tpl.TimeZone = ""
+	tpl.Location = timeutil.SystemLocation()
+	tpl.Version = record.Version
 	tpl.Tags = nil
+	tpl.ManualRequest = api.ManualRequest{}
 	tpl.EventStatus = api.SchedEventIdle
 	tpl.EventID = ""
 	tpl.EventData = nil
 	tpl.EventStart = zeroTime
+	tpl.EventExtra = api.EventExtra{}
 	tpl.Watermark = zeroTime
 	tpl.SummaryData = nil
 	require.Equal(t, *tpl, *record)
@@ -248,6 +355,22 @@ func runTimerStoreUpdate(ctx context.Context, t *testing.T, store *api.TimerStor
 		SchedPolicyExpr: api.NewOptionalVal("2x"),
 	})
 	require.EqualError(t, err, "schedule event configuration is not valid: invalid schedule event expr '2x': unknown unit x")
+	record, err = store.GetByID(ctx, tpl.ID)
+	require.NoError(t, err)
+	require.Equal(t, *tpl, *record)
+
+	err = store.Update(ctx, tpl.ID, &api.TimerUpdate{
+		TimeZone: api.NewOptionalVal("invalid"),
+	})
+	require.ErrorContains(t, err, "Unknown or incorrect time zone: 'invalid'")
+	record, err = store.GetByID(ctx, tpl.ID)
+	require.NoError(t, err)
+	require.Equal(t, *tpl, *record)
+
+	err = store.Update(ctx, tpl.ID, &api.TimerUpdate{
+		TimeZone: api.NewOptionalVal("tidb"),
+	})
+	require.ErrorContains(t, err, "Unknown or incorrect time zone: 'tidb'")
 	record, err = store.GetByID(ctx, tpl.ID)
 	require.NoError(t, err)
 	require.Equal(t, *tpl, *record)
@@ -308,6 +431,7 @@ func runTimerStoreInsertAndList(ctx context.Context, t *testing.T, store *api.Ti
 	got, err := store.GetByID(ctx, id)
 	require.NoError(t, err)
 	recordTpl1.ID = got.ID
+	recordTpl1.Location = timeutil.SystemLocation()
 	recordTpl1.Version = got.Version
 	recordTpl1.CreateTime = got.CreateTime
 
@@ -317,6 +441,7 @@ func runTimerStoreInsertAndList(ctx context.Context, t *testing.T, store *api.Ti
 	require.NoError(t, err)
 	recordTpl2.ID = got.ID
 	recordTpl2.Version = got.Version
+	recordTpl2.Location = timeutil.SystemLocation()
 	recordTpl2.CreateTime = got.CreateTime
 
 	id, err = store.Create(ctx, &recordTpl3)
@@ -325,6 +450,7 @@ func runTimerStoreInsertAndList(ctx context.Context, t *testing.T, store *api.Ti
 	require.NoError(t, err)
 	recordTpl3.ID = got.ID
 	recordTpl3.Version = got.Version
+	recordTpl3.Location = timeutil.SystemLocation()
 	recordTpl3.CreateTime = got.CreateTime
 
 	checkList := func(expected []*api.TimerRecord, list []*api.TimerRecord) {
@@ -632,4 +758,117 @@ func runNotifierTest(t *testing.T, notifier api.TimerWatchEventNotifier) {
 	checkWatcherClosed(watcher2, false)
 	checkWatcherClosed(watcher3, true)
 	checkWatcherClosed(watcher4, true)
+}
+
+type mockHook struct {
+	preFunc   func(ctx context.Context, event api.TimerShedEvent) (api.PreSchedEventResult, error)
+	schedFunc func(ctx context.Context, event api.TimerShedEvent) error
+}
+
+func (h *mockHook) Start() {}
+
+func (h *mockHook) Stop() {}
+
+func (h *mockHook) OnPreSchedEvent(ctx context.Context, event api.TimerShedEvent) (r api.PreSchedEventResult, err error) {
+	if h.preFunc != nil {
+		return h.preFunc(ctx, event)
+	}
+	return
+}
+
+func (h *mockHook) OnSchedEvent(ctx context.Context, event api.TimerShedEvent) error {
+	if h.schedFunc != nil {
+		return h.schedFunc(ctx, event)
+	}
+	return nil
+}
+
+func TestTableStoreManualTrigger(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := testkit.NewTestKit(t, store)
+	dbName := "test"
+	tblName := "timerstore"
+	tk.MustExec("use test")
+	tk.MustExec(tablestore.CreateTimerTableSQL(dbName, tblName))
+
+	pool := pools.NewResourcePool(func() (pools.Resource, error) {
+		return tk.Session(), nil
+	}, 1, 1, time.Second)
+	defer pool.Close()
+
+	timerStore := tablestore.NewTableTimerStore(1, pool, dbName, tblName, nil)
+	defer timerStore.Close()
+
+	var hookReqID atomic.Pointer[string]
+	hook := &mockHook{
+		preFunc: func(ctx context.Context, event api.TimerShedEvent) (r api.PreSchedEventResult, err error) {
+			timer := event.Timer()
+			require.False(t, timer.ManualProcessed)
+			require.Empty(t, timer.ManualEventID)
+			return
+		},
+		schedFunc: func(ctx context.Context, event api.TimerShedEvent) error {
+			timer := event.Timer()
+			require.Equal(t, timer.ManualRequestID, timer.EventManualRequestID)
+			require.Equal(t, timer.Watermark.Unix(), timer.EventWatermark.Unix())
+			require.True(t, timer.ManualProcessed)
+			require.Equal(t, timer.EventID, timer.ManualEventID)
+			hookReqID.Store(&timer.EventManualRequestID)
+			return nil
+		},
+	}
+
+	rt := runtime.NewTimerRuntimeBuilder("test", timerStore).
+		RegisterHookFactory("hook1", func(hookClass string, cli api.TimerClient) api.Hook { return hook }).
+		Build()
+
+	rt.Start()
+	defer rt.Stop()
+
+	cli := api.NewDefaultTimerClient(timerStore)
+	timer, err := cli.CreateTimer(context.TODO(), api.TimerSpec{
+		Key:             "key1",
+		HookClass:       "hook1",
+		SchedPolicyType: api.SchedEventInterval,
+		SchedPolicyExpr: "1h",
+		Watermark:       time.Now(),
+		Enable:          true,
+	})
+	require.NoError(t, err)
+
+	reqID, err := cli.ManualTriggerEvent(context.TODO(), timer.ID)
+	require.NoError(t, err)
+	start := time.Now()
+	eventID := ""
+	for eventID == "" {
+		if time.Since(start) > time.Minute {
+			require.FailNow(t, "timeout")
+		}
+		time.Sleep(100 * time.Millisecond)
+		timer, err = cli.GetTimerByID(context.TODO(), timer.ID)
+		require.NoError(t, err)
+		require.Equal(t, reqID, timer.ManualRequestID)
+		eventID = timer.EventID
+	}
+
+	require.Equal(t, reqID, timer.ManualRequestID)
+	require.Equal(t, eventID, timer.ManualEventID)
+	require.True(t, timer.ManualProcessed)
+	require.Equal(t, reqID, timer.EventManualRequestID)
+	start = time.Now()
+	for hookReqID.Load() == nil {
+		if time.Since(start) > time.Minute {
+			require.FailNow(t, "timeout")
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
+	require.Equal(t, reqID, *hookReqID.Load())
+
+	require.NoError(t, cli.CloseTimerEvent(context.TODO(), timer.ID, timer.EventID))
+	timer, err = cli.GetTimerByID(context.TODO(), timer.ID)
+	require.NoError(t, err)
+	require.Equal(t, reqID, timer.ManualRequestID)
+	require.Equal(t, eventID, timer.ManualEventID)
+	require.True(t, timer.ManualProcessed)
+	require.Equal(t, api.EventExtra{}, timer.EventExtra)
 }

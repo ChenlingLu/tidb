@@ -37,6 +37,7 @@ import (
 	"github.com/pingcap/tidb/domain/infosync"
 	"github.com/pingcap/tidb/errno"
 	"github.com/pingcap/tidb/executor/importer"
+	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/parser/ast"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table/tables"
@@ -165,12 +166,13 @@ func (h *flowHandle) switchTiKVMode(ctx context.Context, task *proto.Task) {
 	}
 
 	logger := logutil.BgLogger().With(zap.Int64("task-id", task.ID))
-	switcher, err := importer.GetTiKVModeSwitcher(logger)
+	pdCli, switcher, err := importer.GetTiKVModeSwitcherWithPDClient(ctx, logger)
 	if err != nil {
 		logger.Warn("get tikv mode switcher failed", zap.Error(err))
 		return
 	}
 	switcher.ToImportMode(ctx)
+	pdCli.Close()
 	h.lastSwitchTime.Store(time.Now())
 }
 
@@ -335,12 +337,13 @@ func (h *flowHandle) switchTiKV2NormalMode(ctx context.Context, task *proto.Task
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	switcher, err := importer.GetTiKVModeSwitcher(logger)
+	pdCli, switcher, err := importer.GetTiKVModeSwitcherWithPDClient(ctx, logger)
 	if err != nil {
 		logger.Warn("get tikv mode switcher failed", zap.Error(err))
 		return
 	}
 	switcher.ToNormalMode(ctx)
+	pdCli.Close()
 
 	// clear it, so next task can switch TiKV mode again.
 	h.lastSwitchTime.Store(time.Time{})
@@ -350,7 +353,8 @@ func (h *flowHandle) updateCurrentTask(task *proto.Task) {
 	if h.currTaskID.Swap(task.ID) != task.ID {
 		taskMeta := &TaskMeta{}
 		if err := json.Unmarshal(task.Meta, taskMeta); err == nil {
-			h.disableTiKVImportMode.Store(taskMeta.Plan.DisableTiKVImportMode)
+			// for raftkv2, switch mode in local backend
+			h.disableTiKVImportMode.Store(taskMeta.Plan.DisableTiKVImportMode || taskMeta.Plan.IsRaftKV2)
 		}
 	}
 }
@@ -520,10 +524,17 @@ func toPostProcessStep(handle dispatcher.TaskHandle, gTask *proto.Task, taskMeta
 		subtaskMetas = append(subtaskMetas, &subtaskMeta)
 	}
 	var localChecksum verify.KVChecksum
+	maxIDs := make(map[autoid.AllocatorType]int64, 3)
 	columnSizeMap := make(map[int64]int64)
 	for _, subtaskMeta := range subtaskMetas {
 		checksum := verify.MakeKVChecksum(subtaskMeta.Checksum.Size, subtaskMeta.Checksum.KVs, subtaskMeta.Checksum.Sum)
 		localChecksum.Add(&checksum)
+
+		for key, val := range subtaskMeta.MaxIDs {
+			if maxIDs[key] < val {
+				maxIDs[key] = val
+			}
+		}
 
 		taskMeta.Result.ReadRowCnt += subtaskMeta.Result.ReadRowCnt
 		taskMeta.Result.LoadedRowCnt += subtaskMeta.Result.LoadedRowCnt
@@ -541,6 +552,7 @@ func toPostProcessStep(handle dispatcher.TaskHandle, gTask *proto.Task, taskMeta
 			KVs:  localChecksum.SumKVS(),
 			Sum:  localChecksum.Sum(),
 		},
+		MaxIDs: maxIDs,
 	}, nil
 }
 

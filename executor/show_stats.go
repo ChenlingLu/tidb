@@ -15,8 +15,10 @@
 package executor
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/pingcap/errors"
@@ -24,11 +26,11 @@ import (
 	"github.com/pingcap/tidb/parser/ast"
 	"github.com/pingcap/tidb/parser/model"
 	"github.com/pingcap/tidb/parser/mysql"
+	"github.com/pingcap/tidb/planner/cardinality"
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/collate"
 	"github.com/tikv/client-go/v2/oracle"
-	"golang.org/x/exp/slices"
 )
 
 func (e *ShowExec) fetchShowStatsExtended() error {
@@ -224,7 +226,7 @@ func (e *ShowExec) appendTableForStatsHistograms(dbName, tblName, partitionName 
 		if !col.IsStatsInitialized() {
 			continue
 		}
-		e.histogramToRow(dbName, tblName, partitionName, col.Info.Name.O, 0, col.Histogram, col.AvgColSize(statsTbl.RealtimeCount, false),
+		e.histogramToRow(dbName, tblName, partitionName, col.Info.Name.O, 0, col.Histogram, cardinality.AvgColSize(col, statsTbl.RealtimeCount, false),
 			col.StatsLoadedStatus.StatusToString(), col.MemoryUsage())
 	}
 	for _, idx := range stableIdxsStats(statsTbl.Indices) {
@@ -257,7 +259,7 @@ func (e *ShowExec) histogramToRow(dbName, tblName, partitionName, colName string
 	})
 }
 
-func (e *ShowExec) versionToTime(version uint64) types.Time {
+func (*ShowExec) versionToTime(version uint64) types.Time {
 	t := oracle.GetTimeFromTS(version)
 	return types.NewTime(types.FromGoTime(t), mysql.TypeDatetime, 0)
 }
@@ -384,7 +386,7 @@ func stableColsStats(colStats map[int64]*statistics.Column) (cols []*statistics.
 	for _, col := range colStats {
 		cols = append(cols, col)
 	}
-	slices.SortFunc(cols, func(i, j *statistics.Column) bool { return i.ID < j.ID })
+	slices.SortFunc(cols, func(i, j *statistics.Column) int { return cmp.Compare(i.ID, j.ID) })
 	return
 }
 
@@ -392,7 +394,7 @@ func stableIdxsStats(idxStats map[int64]*statistics.Index) (idxs []*statistics.I
 	for _, idx := range idxStats {
 		idxs = append(idxs, idx)
 	}
-	slices.SortFunc(idxs, func(i, j *statistics.Index) bool { return i.ID < j.ID })
+	slices.SortFunc(idxs, func(i, j *statistics.Index) int { return cmp.Compare(i.ID, j.ID) })
 	return
 }
 

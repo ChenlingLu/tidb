@@ -109,12 +109,15 @@ func colNames2ResultFields(schema *expression.Schema, names []*types.FieldName, 
 			dbName = defaultDBCIStr
 		}
 		origColName := names[i].OrigColName
+		emptyOrgName := false
 		if origColName.L == "" {
 			origColName = names[i].ColName
+			emptyOrgName = true
 		}
 		rf := &ast.ResultField{
 			Column:       &model.ColumnInfo{Name: origColName, FieldType: *schema.Columns[i].RetType},
 			ColumnAsName: names[i].ColName,
+			EmptyOrgName: emptyOrgName,
 			Table:        &model.TableInfo{Name: names[i].OrigTblName},
 			TableAsName:  names[i].TblName,
 			DBName:       dbName,
@@ -167,10 +170,10 @@ func (a *recordSet) Next(ctx context.Context, req *chunk.Chunk) (err error) {
 	return nil
 }
 
-// NewChunk create a chunk base on top-level executor's newFirstChunk().
+// NewChunk create a chunk base on top-level executor's exec.NewFirstChunk().
 func (a *recordSet) NewChunk(alloc chunk.Allocator) *chunk.Chunk {
 	if alloc == nil {
-		return newFirstChunk(a.executor)
+		return exec.NewFirstChunk(a.executor)
 	}
 
 	base := a.executor.Base()
@@ -530,7 +533,8 @@ func (a *ExecStmt) Exec(ctx context.Context) (_ sqlexec.RecordSet, err error) {
 	if variable.EnableResourceControl.Load() && domain.GetDomain(sctx).RunawayManager() != nil {
 		stmtCtx := sctx.GetSessionVars().StmtCtx
 		_, planDigest := GetPlanDigest(stmtCtx)
-		stmtCtx.RunawayChecker = domain.GetDomain(sctx).RunawayManager().DeriveChecker(sctx.GetSessionVars().ResourceGroupName, stmtCtx.OriginalSQL, planDigest.String())
+		_, digest := stmtCtx.SQLDigest()
+		stmtCtx.RunawayChecker = domain.GetDomain(sctx).RunawayManager().DeriveChecker(sctx.GetSessionVars().ResourceGroupName, stmtCtx.OriginalSQL, digest.String(), planDigest.String())
 		if err := stmtCtx.RunawayChecker.BeforeExecutor(); err != nil {
 			return nil, err
 		}
@@ -690,7 +694,7 @@ func (a *ExecStmt) handleForeignKeyCascade(ctx context.Context, fkc *FKCascadeEx
 			terror.Call(e.Close)
 			return err
 		}
-		err = Next(ctx, e, newFirstChunk(e))
+		err = exec.Next(ctx, e, exec.NewFirstChunk(e))
 		if err != nil {
 			return err
 		}
@@ -844,7 +848,7 @@ func (c *chunkRowRecordSet) Fields() []*ast.ResultField {
 	return c.fields
 }
 
-func (c *chunkRowRecordSet) Next(ctx context.Context, chk *chunk.Chunk) error {
+func (c *chunkRowRecordSet) Next(_ context.Context, chk *chunk.Chunk) error {
 	chk.Reset()
 	if !chk.IsFull() && c.idx < len(c.rows) {
 		numToAppend := mathutil.Min(len(c.rows)-c.idx, chk.RequiredRows()-chk.NumRows())
@@ -856,7 +860,7 @@ func (c *chunkRowRecordSet) Next(ctx context.Context, chk *chunk.Chunk) error {
 
 func (c *chunkRowRecordSet) NewChunk(alloc chunk.Allocator) *chunk.Chunk {
 	if alloc == nil {
-		return newFirstChunk(c.e)
+		return exec.NewFirstChunk(c.e)
 	}
 
 	base := c.e.Base()
@@ -917,7 +921,7 @@ func (a *ExecStmt) runPessimisticSelectForUpdate(ctx context.Context, e exec.Exe
 	}()
 	var rows []chunk.Row
 	var err error
-	req := tryNewCacheChunk(e)
+	req := exec.TryNewCacheChunk(e)
 	for {
 		err = a.next(ctx, e, req)
 		if err != nil {
@@ -961,7 +965,7 @@ func (a *ExecStmt) handleNoDelayExecutor(ctx context.Context, e exec.Executor) (
 		}
 	}
 
-	err = a.next(ctx, e, tryNewCacheChunk(e))
+	err = a.next(ctx, e, exec.TryNewCacheChunk(e))
 	if err != nil {
 		return nil, err
 	}
@@ -1216,7 +1220,7 @@ func (a *ExecStmt) openExecutor(ctx context.Context, e exec.Executor) (err error
 
 func (a *ExecStmt) next(ctx context.Context, e exec.Executor, req *chunk.Chunk) error {
 	start := time.Now()
-	err := Next(ctx, e, req)
+	err := exec.Next(ctx, e, req)
 	a.phaseNextDurations[0] += time.Since(start)
 	return err
 }
@@ -1644,6 +1648,7 @@ func (a *ExecStmt) LogSlowQuery(txnTS uint64, succ bool, hasMoreResults bool) {
 			Detail:     stmtCtx.GetExecDetails(),
 			Succ:       succ,
 			ConnID:     sessVars.ConnectionID,
+			SessAlias:  sessVars.SessionAlias,
 			TxnTS:      txnTS,
 			User:       userString,
 			DB:         sessVars.CurrentDB,
@@ -1654,10 +1659,10 @@ func (a *ExecStmt) LogSlowQuery(txnTS uint64, succ bool, hasMoreResults bool) {
 	}
 }
 
-func extractMsgFromSQLWarn(SQLWarn *stmtctx.SQLWarn) string {
+func extractMsgFromSQLWarn(sqlWarn *stmtctx.SQLWarn) string {
 	// Currently, this function is only used in collectWarningsForSlowLog.
 	// collectWarningsForSlowLog can make sure SQLWarn is not nil so no need to add a nil check here.
-	warn := errors.Cause(SQLWarn.Err)
+	warn := errors.Cause(sqlWarn.Err)
 	if x, ok := warn.(*terror.Error); ok && x != nil {
 		sqlErr := terror.ToSQLError(x)
 		return sqlErr.Message
@@ -1776,7 +1781,8 @@ func getEncodedPlan(stmtCtx *stmtctx.StatementContext, genHint bool) (encodedPla
 			// some hints like 'memory_quota' cannot be extracted from the PhysicalPlan directly,
 			// so we have to iterate all hints from the customer and keep some other necessary hints.
 			switch tableHint.HintName.L {
-			case "memory_quota", "use_toja", "no_index_merge", "max_execution_time",
+			case plannercore.HintMemoryQuota, plannercore.HintUseToja, plannercore.HintNoIndexMerge,
+				plannercore.HintMaxExecutionTime, plannercore.HintTidbKvReadTimeout,
 				plannercore.HintIgnoreIndex, plannercore.HintReadFromStorage, plannercore.HintMerge,
 				plannercore.HintSemiJoinRewrite, plannercore.HintNoDecorrelate:
 				hints = append(hints, tableHint)

@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ngaut/pools"
@@ -26,9 +27,11 @@ import (
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/parser/terror"
 	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/timer/api"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/sqlexec"
+	"github.com/pingcap/tidb/util/timeutil"
 	"github.com/tikv/client-go/v2/util"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -194,20 +197,39 @@ func (s *tableTimerStoreCore) List(ctx context.Context, cond api.Cond) ([]*api.T
 				Key:             row.GetString(2),
 				Tags:            ext.Tags,
 				Data:            timerData,
+				TimeZone:        row.GetString(4),
 				SchedPolicyType: api.SchedPolicyType(row.GetString(5)),
 				SchedPolicyExpr: row.GetString(6),
 				HookClass:       row.GetString(7),
 				Watermark:       watermark,
 				Enable:          row.GetInt64(9) != 0,
 			},
-			EventStatus: api.SchedEventStatus(row.GetString(11)),
-			EventID:     row.GetString(12),
-			EventData:   eventData,
-			EventStart:  eventStart,
-			SummaryData: summaryData,
-			CreateTime:  createTime,
-			Version:     row.GetUint64(18),
+			ManualRequest: ext.Manual.ToManualRequest(),
+			EventStatus:   api.SchedEventStatus(row.GetString(11)),
+			EventID:       row.GetString(12),
+			EventData:     eventData,
+			EventStart:    eventStart,
+			EventExtra:    ext.Event.ToEventExtra(),
+			SummaryData:   summaryData,
+			CreateTime:    createTime,
+			Version:       row.GetUint64(18),
 		}
+
+		tz := timer.TimeZone
+		// handling value "TIDB" is for compatibility of version 7.3.0
+		if tz == "" || strings.EqualFold(tz, "TIDB") {
+			if tz, err = sctx.GetSessionVars().GetGlobalSystemVar(ctx, variable.TimeZone); err != nil {
+				return nil, err
+			}
+		}
+
+		loc, err := timeutil.ParseTimeZone(tz)
+		if err == nil {
+			timer.Location = loc
+		} else {
+			timer.Location = timeutil.SystemLocation()
+		}
+
 		timers = append(timers, timer)
 	}
 	return timers, nil
@@ -319,7 +341,11 @@ func (s *tableTimerStoreCore) takeSession() (sessionctx.Context, func(), error) 
 
 	back := func() {
 		if _, err = executeSQL(context.Background(), sctx, "ROLLBACK"); err != nil {
+			// Though this branch is rarely to be called because "ROLLBACK" will always be successfully, we still need
+			// to handle it here to make sure the code is strong.
 			terror.Log(err)
+			// call `r.Close()` to make sure the resource is released to avoid memory leak
+			r.Close()
 			return
 		}
 		s.pool.Put(r)
@@ -335,6 +361,12 @@ func checkUpdateConstraints(update *api.TimerUpdate, eventID string, version uin
 
 	if val, ok := update.CheckVersion.Get(); ok && version != val {
 		return api.ErrVersionNotMatch
+	}
+
+	if val, ok := update.TimeZone.Get(); ok {
+		if err := api.ValidateTimeZone(val); err != nil {
+			return err
+		}
 	}
 
 	checkPolicy := false

@@ -24,6 +24,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -46,7 +47,6 @@ import (
 	"github.com/tikv/client-go/v2/tikv"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
-	"golang.org/x/exp/slices"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -134,7 +134,7 @@ type Engine struct {
 	config    backend.LocalEngineConfig
 	tableInfo *checkpoints.TidbTableInfo
 
-	dupDetectOpt DupDetectOpt
+	dupDetectOpt common.DupDetectOpt
 
 	// total size of SST files waiting to be ingested
 	pendingFileSize atomic.Int64
@@ -143,7 +143,7 @@ type Engine struct {
 	importedKVSize  atomic.Int64
 	importedKVCount atomic.Int64
 
-	keyAdapter         KeyAdapter
+	keyAdapter         common.KeyAdapter
 	duplicateDetection bool
 	duplicateDB        *pebble.DB
 
@@ -418,7 +418,7 @@ func (s *sizeProperties) iter(f func(p *rangeProperty) bool) {
 	})
 }
 
-func decodeRangeProperties(data []byte, keyAdapter KeyAdapter) (rangeProperties, error) {
+func decodeRangeProperties(data []byte, keyAdapter common.KeyAdapter) (rangeProperties, error) {
 	r := make(rangeProperties, 0, 16)
 	for len(data) > 0 {
 		if len(data) < 4 {
@@ -449,7 +449,7 @@ func decodeRangeProperties(data []byte, keyAdapter KeyAdapter) (rangeProperties,
 // getSizePropertiesFn is used to let unit test replace the real function.
 var getSizePropertiesFn = getSizeProperties
 
-func getSizeProperties(logger log.Logger, db *pebble.DB, keyAdapter KeyAdapter) (*sizeProperties, error) {
+func getSizeProperties(logger log.Logger, db *pebble.DB, keyAdapter common.KeyAdapter) (*sizeProperties, error) {
 	sstables, err := db.SSTables(pebble.WithProperties())
 	if err != nil {
 		logger.Warn("get sst table properties failed", log.ShortError(err))
@@ -486,16 +486,7 @@ func (e *Engine) getEngineFileSize() backend.EngineFileSize {
 	var memSize int64
 	e.localWriters.Range(func(k, v interface{}) bool {
 		w := k.(*Writer)
-		w.Lock()
-		defer w.Unlock()
-		if w.writer != nil {
-			memSize += int64(w.writer.writer.EstimatedSize())
-		} else {
-			// if kvs are still in memory, only calculate half of the total size
-			// in our tests, SST file size is about 50% of the raw kv size
-			memSize += w.batchSize / 2
-		}
-
+		memSize += int64(w.EstimatedSize())
 		return true
 	})
 
@@ -783,8 +774,8 @@ func (e *Engine) batchIngestSSTs(metas []*sstMeta) error {
 	if len(metas) == 0 {
 		return nil
 	}
-	slices.SortFunc(metas, func(i, j *sstMeta) bool {
-		return bytes.Compare(i.minKey, j.minKey) < 0
+	slices.SortFunc(metas, func(i, j *sstMeta) int {
+		return bytes.Compare(i.minKey, j.minKey)
 	})
 
 	// non overlapping sst is grouped, and ingested in that order
@@ -956,9 +947,11 @@ func (e *Engine) newKVIter(ctx context.Context, opts *pebble.IterOptions) Iter {
 	return newDupDetectIter(e.getDB(), e.keyAdapter, opts, e.duplicateDB, logger, e.dupDetectOpt)
 }
 
-// getFirstAndLastKey reads the first and last key in range [lowerBound, upperBound)
+var _ common.IngestData = (*Engine)(nil)
+
+// GetFirstAndLastKey reads the first and last key in range [lowerBound, upperBound)
 // in the engine. Empty upperBound means unbounded.
-func (e *Engine) getFirstAndLastKey(lowerBound, upperBound []byte) ([]byte, []byte, error) {
+func (e *Engine) GetFirstAndLastKey(lowerBound, upperBound []byte) ([]byte, []byte, error) {
 	if len(upperBound) == 0 {
 		// we use empty slice for unbounded upper bound, but it means max value in pebble
 		// so reset to nil
@@ -989,6 +982,28 @@ func (e *Engine) getFirstAndLastKey(lowerBound, upperBound []byte) ([]byte, []by
 	return firstKey, lastKey, nil
 }
 
+// NewIter implements IngestData interface.
+func (e *Engine) NewIter(ctx context.Context, lowerBound, upperBound []byte) common.ForwardIter {
+	return e.newKVIter(ctx, &pebble.IterOptions{LowerBound: lowerBound, UpperBound: upperBound})
+}
+
+// GetTS implements IngestData interface.
+func (e *Engine) GetTS() uint64 {
+	return e.TS
+}
+
+// Finish implements IngestData interface.
+func (e *Engine) Finish(totalBytes, totalCount int64) {
+	e.importedKVSize.Add(totalBytes)
+	e.importedKVCount.Add(totalCount)
+}
+
+// LoadIngestData return (local) Engine itself because Engine has implemented
+// IngestData interface.
+func (e *Engine) LoadIngestData(_ context.Context, _, _ []byte) (common.IngestData, error) {
+	return e, nil
+}
+
 type sstMeta struct {
 	path       string
 	minKey     []byte
@@ -1009,7 +1024,8 @@ type Writer struct {
 	// if the KVs are append in order, we can directly write the into SST file,
 	// else we must first store them in writeBatch and then batch flush into SST file.
 	isKVSorted bool
-	writer     *sstWriter
+	writer     atomic.Pointer[sstWriter]
+	writerSize atomic.Uint64
 
 	// bytes buffer for writeBatch
 	kvBuffer   *membuf.Buffer
@@ -1020,33 +1036,34 @@ type Writer struct {
 	sortedKeyBuf       []byte
 
 	batchCount int
-	batchSize  int64
+	batchSize  atomic.Int64
 
 	lastMetaSeq int32
 
 	tikvCodec tikv.Codec
 }
 
-func (w *Writer) appendRowsSorted(kvs []common.KvPair) error {
-	if w.writer == nil {
-		writer, err := w.createSSTWriter()
+func (w *Writer) appendRowsSorted(kvs []common.KvPair) (err error) {
+	writer := w.writer.Load()
+	if writer == nil {
+		writer, err = w.createSSTWriter()
 		if err != nil {
 			return errors.Trace(err)
 		}
-		w.writer = writer
+		w.writer.Store(writer)
 	}
 
 	keyAdapter := w.engine.keyAdapter
 	totalKeySize := 0
 	for i := 0; i < len(kvs); i++ {
 		keySize := keyAdapter.EncodedLen(kvs[i].Key, kvs[i].RowID)
-		w.batchSize += int64(keySize + len(kvs[i].Val))
+		w.batchSize.Add(int64(keySize + len(kvs[i].Val)))
 		totalKeySize += keySize
 	}
 	w.batchCount += len(kvs)
-	// noopKeyAdapter doesn't really change the key,
+	// NoopKeyAdapter doesn't really change the key,
 	// skipping the encoding to avoid unnecessary alloc and copy.
-	if _, ok := keyAdapter.(noopKeyAdapter); !ok {
+	if _, ok := keyAdapter.(common.NoopKeyAdapter); !ok {
 		if cap(w.sortedKeyBuf) < totalKeySize {
 			w.sortedKeyBuf = make([]byte, totalKeySize)
 		}
@@ -1059,7 +1076,11 @@ func (w *Writer) appendRowsSorted(kvs []common.KvPair) error {
 		}
 		kvs = newKvs
 	}
-	return w.writer.writeKVs(kvs)
+	if err := writer.writeKVs(kvs); err != nil {
+		return err
+	}
+	w.writerSize.Store(writer.writer.EstimatedSize())
+	return nil
 }
 
 func (w *Writer) appendRowsUnsorted(ctx context.Context, kvs []common.KvPair) error {
@@ -1075,7 +1096,7 @@ func (w *Writer) appendRowsUnsorted(ctx context.Context, kvs []common.KvPair) er
 			w.isWriteBatchSorted = false
 		}
 		lastKey = pair.Key
-		w.batchSize += int64(len(pair.Key) + len(pair.Val))
+		w.batchSize.Add(int64(len(pair.Key) + len(pair.Val)))
 		buf := w.kvBuffer.AllocBytes(keyAdapter.EncodedLen(pair.Key, pair.RowID))
 		key := keyAdapter.Encode(buf[:0], pair.Key, pair.RowID)
 		val := w.kvBuffer.AddBytes(pair.Val)
@@ -1089,7 +1110,7 @@ func (w *Writer) appendRowsUnsorted(ctx context.Context, kvs []common.KvPair) er
 	}
 	w.batchCount = cnt
 
-	if w.batchSize > w.memtableSizeLimit {
+	if w.batchSize.Load() > w.memtableSizeLimit {
 		if err := w.flushKVs(ctx); err != nil {
 			return err
 		}
@@ -1116,7 +1137,7 @@ func (w *Writer) AppendRows(ctx context.Context, columnNames []string, rows enco
 	defer w.Unlock()
 
 	// if chunk has _tidb_rowid field, we can't ensure that the rows are sorted.
-	if w.isKVSorted && w.writer == nil {
+	if w.isKVSorted && w.writer.Load() == nil {
 		for _, c := range columnNames {
 			if c == model.ExtraHandleName.L {
 				w.isKVSorted = false
@@ -1143,12 +1164,14 @@ func (w *Writer) flush(ctx context.Context) error {
 		}
 	}
 
-	if w.writer != nil {
-		meta, err := w.writer.close()
+	writer := w.writer.Load()
+	if writer != nil {
+		meta, err := writer.close()
 		if err != nil {
 			return errors.Trace(err)
 		}
-		w.writer = nil
+		w.writer.Store(nil)
+		w.writerSize.Store(0)
 		w.batchCount = 0
 		if meta != nil && meta.totalSize > 0 {
 			return w.addSST(ctx, meta)
@@ -1156,6 +1179,16 @@ func (w *Writer) flush(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// EstimatedSize returns the estimated size of the SST file.
+func (w *Writer) EstimatedSize() uint64 {
+	if size := w.writerSize.Load(); size > 0 {
+		return size
+	}
+	// if kvs are still in memory, only calculate half of the total size
+	// in our tests, SST file size is about 50% of the raw kv size
+	return uint64(w.batchSize.Load()) / 2
 }
 
 type flushStatus struct {
@@ -1191,8 +1224,8 @@ func (w *Writer) flushKVs(ctx context.Context) error {
 		return errors.Trace(err)
 	}
 	if !w.isWriteBatchSorted {
-		slices.SortFunc(w.writeBatch[:w.batchCount], func(i, j common.KvPair) bool {
-			return bytes.Compare(i.Key, j.Key) < 0
+		slices.SortFunc(w.writeBatch[:w.batchCount], func(i, j common.KvPair) int {
+			return bytes.Compare(i.Key, j.Key)
 		})
 		w.isWriteBatchSorted = true
 	}
@@ -1219,7 +1252,7 @@ func (w *Writer) flushKVs(ctx context.Context) error {
 		return errors.Trace(err)
 	}
 
-	w.batchSize = 0
+	w.batchSize.Store(0)
 	w.batchCount = 0
 	w.kvBuffer.Reset()
 	return nil

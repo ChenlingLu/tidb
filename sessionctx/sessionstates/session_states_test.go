@@ -171,6 +171,28 @@ func TestSystemVars(t *testing.T) {
 			checkStmt:       "select rand()",
 			expectedValue:   "0.11641535266900002",
 		},
+		{
+			// tidb_enforce_mpp depends on tidb_allow_mpp.
+			stmts: []string{
+				"set @@global.tidb_allow_mpp=0",
+				"set @@tidb_allow_mpp=1",
+				"set @@tidb_enforce_mpp=1",
+			},
+			inSessionStates: true,
+			varName:         variable.TiDBEnforceMPPExecution,
+			expectedValue:   "1",
+		},
+		{
+			// tx_read_only depends on tidb_enable_noop_functions.
+			stmts: []string{
+				"set @@global.tidb_enable_noop_functions=0",
+				"set @@tidb_enable_noop_functions=1",
+				"set @@tx_read_only=1",
+			},
+			inSessionStates: true,
+			varName:         variable.TxReadOnly,
+			expectedValue:   "1",
+		},
 	}
 
 	if !sem.IsEnabled() {
@@ -493,6 +515,18 @@ func TestSessionCtx(t *testing.T) {
 					") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"))
 				tk.MustQuery(`explain select id from test.t1`).Check(testkit.Rows(`TableReader_5 10000.00 root  data:TableFullScan_4`,
 					`└─TableFullScan_4 10000.00 cop[tikv] table:t1 keep order:false, stats:pseudo`))
+			},
+		},
+		{
+			// check request source
+			setFunc: func(tk *testkit.TestKit) any {
+				tk.MustExec(`set @@tidb_request_source_type="lightning"`)
+				require.Equal(t, "lightning", tk.Session().GetSessionVars().ExplicitRequestSourceType)
+				return nil
+			},
+			checkFunc: func(tk *testkit.TestKit, param any) {
+				tk.MustExec(`select count(*) from test.t1`)
+				tk.MustQuery(`select @@tidb_request_source_type`).Check(testkit.Rows("lightning"))
 			},
 		},
 	}
@@ -1000,9 +1034,9 @@ func TestPreparedStatements(t *testing.T) {
 				require.NoError(t, conn.Dispatch(context.Background(), cmd))
 				cmd = getFetchBytes(1, 10)
 				require.NoError(t, conn.Dispatch(context.Background(), cmd))
-				// This COM_STMT_FETCH returns EOF.
+				// This COM_STMT_FETCH returns error, because the cursor has been automatically closed.
 				cmd = getFetchBytes(1, 10)
-				require.NoError(t, conn.Dispatch(context.Background(), cmd))
+				require.Error(t, conn.Dispatch(context.Background(), cmd))
 				return uint32(1)
 			},
 			checkFunc: func(tk *testkit.TestKit, conn server.MockConn, param any) {
@@ -1373,7 +1407,7 @@ func TestShowStateFail(t *testing.T) {
 			},
 		},
 		{
-			// fetched all the data but the EOF packet is not sent
+			// fetched all the data and `ServerStatusLastRowSend` is set, then the cursor should have been closed
 			setFunc: func(tk *testkit.TestKit, conn server.MockConn) {
 				tk.MustExec("create table test.t1(id int)")
 				tk.MustExec("insert test.t1 value(1), (2), (3)")
@@ -1383,26 +1417,8 @@ func TestShowStateFail(t *testing.T) {
 				require.NoError(t, conn.Dispatch(context.Background(), cmd))
 				cmd = getFetchBytes(1, 10)
 				require.NoError(t, conn.Dispatch(context.Background(), cmd))
-			},
-			showErr: errno.ErrCannotMigrateSession,
-			cleanFunc: func(tk *testkit.TestKit) {
-				tk.MustExec("drop table test.t1")
-			},
-		},
-		{
-			// EOF is sent
-			setFunc: func(tk *testkit.TestKit, conn server.MockConn) {
-				tk.MustExec("create table test.t1(id int)")
-				tk.MustExec("insert test.t1 value(1), (2), (3)")
-				cmd := append([]byte{mysql.ComStmtPrepare}, []byte("select * from test.t1")...)
-				require.NoError(t, conn.Dispatch(context.Background(), cmd))
-				cmd = getExecuteBytes(1, true, false)
-				require.NoError(t, conn.Dispatch(context.Background(), cmd))
-				cmd = getFetchBytes(1, 10)
-				require.NoError(t, conn.Dispatch(context.Background(), cmd))
-				// This COM_STMT_FETCH returns EOF.
-				cmd = getFetchBytes(1, 10)
-				require.NoError(t, conn.Dispatch(context.Background(), cmd))
+				// following FETCH command should fail because the cursor has been closed
+				require.Error(t, conn.Dispatch(context.Background(), getFetchBytes(1, 10)))
 			},
 			cleanFunc: func(tk *testkit.TestKit) {
 				tk.MustExec("drop table test.t1")

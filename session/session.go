@@ -76,7 +76,6 @@ import (
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/sessiontxn"
-	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/statistics/handle"
 	storeerr "github.com/pingcap/tidb/store/driver/error"
 	"github.com/pingcap/tidb/store/driver/txn"
@@ -446,30 +445,6 @@ func (s *session) GetSessionManager() util.SessionManager {
 	return s.sessionManager
 }
 
-func (s *session) StoreQueryFeedback(feedback interface{}) {
-	if variable.FeedbackProbability.Load() <= 0 {
-		return
-	}
-	if fb, ok := feedback.(*statistics.QueryFeedback); !ok || fb == nil || !fb.Valid.Load() {
-		return
-	}
-	if s.statsCollector != nil {
-		do, err := GetDomain(s.store)
-		if err != nil {
-			logutil.BgLogger().Debug("domain not found", zap.Error(err))
-			metrics.StoreQueryFeedbackCounter.WithLabelValues(metrics.LblError).Inc()
-			return
-		}
-		err = s.statsCollector.StoreQueryFeedback(feedback, do.StatsHandle(), s.GetSessionVars().GetEnablePseudoForOutdatedStats())
-		if err != nil {
-			logutil.BgLogger().Debug("store query feedback", zap.Error(err))
-			metrics.StoreQueryFeedbackCounter.WithLabelValues(metrics.LblError).Inc()
-			return
-		}
-		metrics.StoreQueryFeedbackCounter.WithLabelValues(metrics.LblOK).Inc()
-	}
-}
-
 func (s *session) UpdateColStatsUsage(predicateColumns []model.TableItemID) {
 	if s.statsCollector == nil {
 		return
@@ -644,6 +619,7 @@ func (s *session) doCommit(ctx context.Context) error {
 	s.txn.SetOption(kv.EnableAsyncCommit, sessVars.EnableAsyncCommit)
 	s.txn.SetOption(kv.Enable1PC, sessVars.Enable1PC)
 	s.txn.SetOption(kv.ResourceGroupTagger, sessVars.StmtCtx.GetResourceGroupTagger())
+	s.txn.SetOption(kv.ExplicitRequestSourceType, sessVars.ExplicitRequestSourceType)
 	if sessVars.StmtCtx.KvExecCounter != nil {
 		// Bind an interceptor for client-go to count the number of SQL executions of each TiKV.
 		s.txn.SetOption(kv.RPCInterceptor, sessVars.StmtCtx.KvExecCounter.RPCInterceptor())
@@ -1578,6 +1554,8 @@ func (s *session) SetProcessInfo(sql string, t time.Time, command byte, maxExecu
 		DiskTracker:           s.sessionVars.DiskTracker,
 		StatsInfo:             plannercore.GetStatsInfo,
 		OOMAlarmVariablesInfo: s.getOomAlarmVariablesInfo(),
+		TableIDs:              s.sessionVars.StmtCtx.TableIDs,
+		IndexNames:            s.sessionVars.StmtCtx.IndexNames,
 		MaxExecutionTime:      maxExecutionTime,
 		RedactSQL:             s.sessionVars.EnableRedactLog,
 		ResourceGroupName:     s.sessionVars.ResourceGroupName,
@@ -2211,7 +2189,16 @@ func (s *session) ExecuteStmt(ctx context.Context, stmtNode ast.StmtNode) (sqlex
 		}
 	})
 
-	stmtLabel := ast.GetStmtLabel(stmtNode)
+	var stmtLabel string
+	if execStmt, ok := stmtNode.(*ast.ExecuteStmt); ok {
+		prepareStmt, err := plannercore.GetPreparedStmt(execStmt, s.sessionVars)
+		if err == nil && prepareStmt.PreparedAst != nil {
+			stmtLabel = ast.GetStmtLabel(prepareStmt.PreparedAst.Stmt)
+		}
+	}
+	if stmtLabel == "" {
+		stmtLabel = ast.GetStmtLabel(stmtNode)
+	}
 	s.setRequestSource(ctx, stmtLabel, stmtNode)
 
 	// Backup the original resource group name since sql hint might change it during optimization
@@ -2223,10 +2210,20 @@ func (s *session) ExecuteStmt(ctx context.Context, stmtNode ast.StmtNode) (sqlex
 	// session resource-group might be changed by query hint, ensure restore it back when
 	// the execution finished.
 	if sessVars.ResourceGroupName != originalResourceGroup {
-		defer func() {
-			// Restore the resource group for the session
+		// if target resource group doesn't exist, fallback to the origin resource group.
+		if _, ok := domain.GetDomain(s).InfoSchema().ResourceGroupByName(model.NewCIStr(sessVars.ResourceGroupName)); !ok {
+			logutil.Logger(ctx).Warn("Unknown resource group from hint", zap.String("name", sessVars.ResourceGroupName))
 			sessVars.ResourceGroupName = originalResourceGroup
-		}()
+			// if we are in a txn, should also reset the txn resource group.
+			if txn, err := s.Txn(false); err == nil && txn != nil && txn.Valid() {
+				kv.SetTxnResourceGroup(txn, originalResourceGroup)
+			}
+		} else {
+			defer func() {
+				// Restore the resource group for the session
+				sessVars.ResourceGroupName = originalResourceGroup
+			}()
+		}
 	}
 	if err != nil {
 		s.rollbackOnError(ctx)
@@ -3135,7 +3132,7 @@ func splitAndScatterTable(store kv.Storage, tableIDs []int64) {
 		ctxWithTimeout, cancel := context.WithTimeout(context.Background(), variable.DefWaitSplitRegionTimeout*time.Second)
 		var regionIDs []uint64
 		for _, id := range tableIDs {
-			regionIDs = append(regionIDs, ddl.SplitRecordRegion(ctxWithTimeout, s, id, variable.DefTiDBScatterRegion))
+			regionIDs = append(regionIDs, ddl.SplitRecordRegion(ctxWithTimeout, s, id, id, variable.DefTiDBScatterRegion))
 		}
 		if variable.DefTiDBScatterRegion {
 			ddl.WaitScatterRegionFinish(ctxWithTimeout, s, regionIDs...)
@@ -3634,8 +3631,10 @@ func createSessionWithOpt(store kv.Storage, opt *Opt) (*session, error) {
 // attachStatsCollector attaches the stats collector in the dom for the session
 func attachStatsCollector(s *session, dom *domain.Domain) *session {
 	if dom.StatsHandle() != nil && dom.StatsUpdating() {
-		s.statsCollector = dom.StatsHandle().NewSessionStatsCollector()
-		if GetIndexUsageSyncLease() > 0 {
+		if s.statsCollector == nil {
+			s.statsCollector = dom.StatsHandle().NewSessionStatsCollector()
+		}
+		if s.idxUsageCollector == nil && GetIndexUsageSyncLease() > 0 {
 			s.idxUsageCollector = dom.StatsHandle().NewSessionIndexUsageCollector()
 		}
 	}
@@ -3645,9 +3644,14 @@ func attachStatsCollector(s *session, dom *domain.Domain) *session {
 
 // detachStatsCollector removes the stats collector in the session
 func detachStatsCollector(s *session) *session {
-	s.statsCollector = nil
-	s.idxUsageCollector = nil
-
+	if s.statsCollector != nil {
+		s.statsCollector.Delete()
+		s.statsCollector = nil
+	}
+	if s.idxUsageCollector != nil {
+		s.idxUsageCollector.Delete()
+		s.idxUsageCollector = nil
+	}
 	return s
 }
 
@@ -3706,7 +3710,8 @@ func getStoreBootstrapVersion(store kv.Storage) int64 {
 		storeBootstrapped[store.UUID()] = true
 	}
 
-	return modifyBootstrapVersionForTest(store, ver)
+	modifyBootstrapVersionForTest(ver)
+	return ver
 }
 
 func finishBootstrap(store kv.Storage) {
@@ -3936,6 +3941,7 @@ func logGeneralQuery(execStmt *executor.ExecStmt, s *session, isPrepared bool) {
 		}
 		logutil.BgLogger().Info("GENERAL_LOG",
 			zap.Uint64("conn", vars.ConnectionID),
+			zap.String("session_alias", vars.SessionAlias),
 			zap.String("user", vars.User.LoginString()),
 			zap.Int64("schemaVersion", s.GetInfoSchema().SchemaMetaVersion()),
 			zap.Uint64("txnStartTS", vars.TxnCtx.StartTS),
@@ -4320,7 +4326,10 @@ func (s *session) DecodeSessionStates(ctx context.Context,
 	}
 
 	// Decode session variables.
-	for name, val := range sessionStates.SystemVars {
+	names := variable.OrderByDependency(sessionStates.SystemVars)
+	// Some variables must be set before others, e.g. tidb_enable_noop_functions should be before noop variables.
+	for _, name := range names {
+		val := sessionStates.SystemVars[name]
 		// Experimental system variables may change scope, data types, or even be removed.
 		// We just ignore the errors and continue.
 		if err := s.sessionVars.SetSystemVar(name, val); err != nil {

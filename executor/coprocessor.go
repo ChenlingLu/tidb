@@ -60,13 +60,13 @@ func (h *CoprocessorDAGHandler) HandleRequest(ctx context.Context, req *coproces
 		return h.buildErrorResponse(err)
 	}
 
-	chk := tryNewCacheChunk(e)
+	chk := exec.TryNewCacheChunk(e)
 	tps := e.Base().RetFieldTypes()
 	var totalChunks, partChunks []tipb.Chunk
 	memTracker := h.sctx.GetSessionVars().StmtCtx.MemTracker
 	for {
 		chk.Reset()
-		err = Next(ctx, e, chk)
+		err = exec.Next(ctx, e, chk)
 		if err != nil {
 			return h.buildErrorResponse(err)
 		}
@@ -100,11 +100,11 @@ func (h *CoprocessorDAGHandler) HandleStreamRequest(ctx context.Context, req *co
 		return stream.Send(h.buildErrorResponse(err))
 	}
 
-	chk := tryNewCacheChunk(e)
+	chk := exec.TryNewCacheChunk(e)
 	tps := e.Base().RetFieldTypes()
 	for {
 		chk.Reset()
-		if err = Next(ctx, e, chk); err != nil {
+		if err = exec.Next(ctx, e, chk); err != nil {
 			return stream.Send(h.buildErrorResponse(err))
 		}
 		if chk.NumRows() == 0 {
@@ -228,7 +228,7 @@ func (h *CoprocessorDAGHandler) buildStreamResponse(chunk *tipb.Chunk) *coproces
 	return resp
 }
 
-func (h *CoprocessorDAGHandler) buildErrorResponse(err error) *coprocessor.Response {
+func (*CoprocessorDAGHandler) buildErrorResponse(err error) *coprocessor.Response {
 	return &coprocessor.Response{
 		OtherError: err.Error(),
 	}
@@ -268,7 +268,7 @@ func (h *CoprocessorDAGHandler) encodeDefault(chk *chunk.Chunk, tps []*types.Fie
 
 const rowsPerChunk = 64
 
-func (h *CoprocessorDAGHandler) appendRow(chunks []tipb.Chunk, data []byte, rowCnt int) []tipb.Chunk {
+func (*CoprocessorDAGHandler) appendRow(chunks []tipb.Chunk, data []byte, rowCnt int) []tipb.Chunk {
 	if rowCnt%rowsPerChunk == 0 {
 		chunks = append(chunks, tipb.Chunk{})
 	}
